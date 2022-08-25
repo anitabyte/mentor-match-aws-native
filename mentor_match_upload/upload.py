@@ -4,6 +4,8 @@ import boto3
 import json
 import io
 
+from datetime import datetime
+
 
 def handler(event, context):
     ddb_table = os.environ["ddb"]
@@ -16,7 +18,7 @@ def handler(event, context):
     mentors = event["mentors"]
     mentees = event["mentees"]
     mentors_key = f"{match_id}-mentors.json"
-    mentees_key = f"{match_id}-mentors.json"
+    mentees_key = f"{match_id}-mentees.json"
 
     bucket_connection = boto3.client("s3")
     bucket_connection.upload_fileobj(
@@ -27,8 +29,15 @@ def handler(event, context):
     )
 
     ddb_connection = boto3.client("dynamodb")
+    dt = datetime.now()
     response = ddb_connection.put_item(
-        TableName=ddb_table, Item={"id": {"S": match_id}, "status": {"S": "PENDING"}}
+        TableName=ddb_table,
+        Item={
+            "id": {"S": match_id},
+            "status": {"S": "PENDING"},
+            "start_time": {"S": dt.isoformat()},
+            "end_time": {"S": ""},
+        },
     )
 
     sqs_connection = boto3.client("sqs")

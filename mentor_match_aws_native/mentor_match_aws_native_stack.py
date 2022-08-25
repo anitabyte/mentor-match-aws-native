@@ -10,7 +10,7 @@ from aws_cdk import (
     aws_dynamodb as ddb,
     aws_lambda,
     aws_lambda_destinations as destinations,
-    aws_lambda_event_sources as sources
+    aws_lambda_event_sources as sources,
 )
 from constructs import Construct
 from pathlib import Path
@@ -29,9 +29,15 @@ class MentorMatchAwsNativeStack(Stack):
             visibility_timeout=Duration.seconds(300),
         )
 
-        publish_queue = sqs.Queue(
+        reduce_queue = sqs.Queue(
             self,
-            "MentorMatchStatusUpdateQueue",
+            "MentorMatchReduceQueue",
+            visibility_timeout=Duration.seconds(300),
+        )
+
+        work_queue = sqs.Queue(
+            self,
+            "MentorMatchWorkQueue",
             visibility_timeout=Duration.seconds(300),
         )
 
@@ -42,7 +48,20 @@ class MentorMatchAwsNativeStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
         )
-
+        results_bucket = s3.Bucket(
+            self,
+            "MentorMatchResults",
+            versioned=False,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+        best_bucket = s3.Bucket(
+            self,
+            "MentorMatchBest",
+            versioned=False,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
         job_state_ddb = ddb.Table(
             self,
             "MentorMatchJobState",
@@ -70,10 +89,10 @@ class MentorMatchAwsNativeStack(Stack):
                 "ddb": job_state_ddb.table_name,
                 "mapping_queue": queue.queue_url,
                 "upload_bucket": bucket.bucket_name,
-                "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+                "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument",
             },
             tracing=aws_lambda.Tracing.ACTIVE,
-            memory_size=1024
+            memory_size=1024,
         )
         upload_function.add_function_url(
             auth_type=aws_lambda.FunctionUrlAuthType.NONE,
@@ -97,7 +116,12 @@ class MentorMatchAwsNativeStack(Stack):
             "MentorMatchMatchFunction",
             runtime=aws_lambda.Runtime.PYTHON_3_9,
             code=aws_lambda.Code.from_asset(
-                str(Path.joinpath(Path(__file__).parent.parent, "mentor_match_generate_matches")),
+                str(
+                    Path.joinpath(
+                        Path(__file__).parent.parent,
+                        "mentor_match_generate_match_tasks",
+                    )
+                ),
                 bundling=BundlingOptions(
                     image=aws_lambda.Runtime.PYTHON_3_9.bundling_image,
                     command=[
@@ -110,13 +134,13 @@ class MentorMatchAwsNativeStack(Stack):
             handler="match.handler",
             environment={
                 "ddb": job_state_ddb.table_name,
-                "mapping_queue": queue.queue_url,
+                "mapping_queue": work_queue.queue_url,
                 "upload_bucket": bucket.bucket_name,
-                "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"
+                "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument",
             },
             tracing=aws_lambda.Tracing.ACTIVE,
-            memory_size=10240,
-            timeout=Duration.seconds(300)
+            timeout=Duration.seconds(300),
+            memory_size=384,
         )
         match_function.add_layers(
             aws_lambda.LayerVersion.from_layer_version_arn(
@@ -129,3 +153,93 @@ class MentorMatchAwsNativeStack(Stack):
         match_function_role = match_function.role
         bucket.grant_read(match_function_role)
         job_state_ddb.grant_read_write_data(match_function_role)
+        work_queue.grant_send_messages(match_function_role)
+
+        match_worker_function = aws_lambda.Function(
+            self,
+            "MentorMatchWorkerFunction",
+            runtime=aws_lambda.Runtime.PYTHON_3_9,
+            code=aws_lambda.Code.from_asset(
+                str(
+                    Path.joinpath(
+                        Path(__file__).parent.parent, "mentor_match_generate_matches"
+                    )
+                ),
+                bundling=BundlingOptions(
+                    image=aws_lambda.Runtime.PYTHON_3_9.bundling_image,
+                    command=[
+                        "bash",
+                        "-c",
+                        "pip install --no-cache -r requirements.txt -t /asset-output && cp -au . /asset-output",
+                    ],
+                ),
+            ),
+            handler="match.handler",
+            environment={
+                "ddb": job_state_ddb.table_name,
+                "reduce_queue": reduce_queue.queue_url,
+                "upload_bucket": bucket.bucket_name,
+                "results_bucket": results_bucket.bucket_name,
+                "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument",
+            },
+            tracing=aws_lambda.Tracing.ACTIVE,
+            memory_size=2048,
+            timeout=Duration.seconds(300),
+        )
+        match_worker_function.add_layers(
+            aws_lambda.LayerVersion.from_layer_version_arn(
+                self,
+                "match_generate_opentelemetry",
+                "arn:aws:lambda:eu-west-2:901920570463:layer:aws-otel-python-amd64-ver-1-11-1:2",
+            )
+        )
+        match_worker_function.add_event_source(
+            sources.SqsEventSource(work_queue, batch_size=1)
+        )
+        match_worker_function_role = match_worker_function.role
+        job_state_ddb.grant_read_write_data(match_worker_function_role)
+        bucket.grant_read(match_worker_function_role)
+        results_bucket.grant_read_write(match_worker_function_role)
+        reduce_queue.grant_send_messages(match_worker_function_role)
+
+        reduce_function = aws_lambda.Function(
+            self,
+            "MentorMatchReduceFunction",
+            runtime=aws_lambda.Runtime.PYTHON_3_9,
+            code=aws_lambda.Code.from_asset(
+                str(Path.joinpath(Path(__file__).parent.parent, "mentor_match_reduce")),
+                bundling=BundlingOptions(
+                    image=aws_lambda.Runtime.PYTHON_3_9.bundling_image,
+                    command=[
+                        "bash",
+                        "-c",
+                        "pip install --no-cache -r requirements.txt -t /asset-output && cp -au . /asset-output",
+                    ],
+                ),
+            ),
+            handler="reduce.handler",
+            environment={
+                "ddb": job_state_ddb.table_name,
+                "reduce_queue": reduce_queue.queue_url,
+                "results_bucket": results_bucket.bucket_name,
+                "best_bucket": best_bucket.bucket_name,
+                "AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument",
+            },
+            tracing=aws_lambda.Tracing.ACTIVE,
+            memory_size=1024,
+            timeout=Duration.seconds(300),
+        )
+        reduce_function.add_layers(
+            aws_lambda.LayerVersion.from_layer_version_arn(
+                self,
+                "reduce_opentelemetry",
+                "arn:aws:lambda:eu-west-2:901920570463:layer:aws-otel-python-amd64-ver-1-11-1:2",
+            )
+        )
+        reduce_function.add_event_source(
+            sources.SqsEventSource(reduce_queue, batch_size=1)
+        )
+        reduce_function_role = reduce_function.role
+        results_bucket.grant_read_write(reduce_function_role)
+        job_state_ddb.grant_read_write_data(reduce_function_role)
+        best_bucket.grant_read_write(reduce_function_role)

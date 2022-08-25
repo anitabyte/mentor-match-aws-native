@@ -41,7 +41,11 @@ class CSPerson(Person):
         self.both = True if kwargs.get("both mentor and mentee") == "yes" else False
         kwargs = self.map_input_to_model(kwargs)
         super(CSPerson, self).__init__(**kwargs)
-        self._connections: list[CSPerson] = []
+        self._connections: list[CSPerson] = [
+            CSMentee(**value) if key == "csmentee" else CSMentor(**value)
+            for x in kwargs.get("connections", [])
+            for key, value in x.items()
+        ]
 
     @classmethod
     def str_grade_to_val(cls, grade: str):
@@ -179,68 +183,79 @@ def handler(event, context):
     event_json = json.loads(event["Records"][0]["body"])
     print(event_json)
     match_id = event_json["match_id"]
-    unmatched_bonus = event_json["unmatched"]
-
-    bucket = os.environ["upload_bucket"]
+    total_tasks = event_json["total_tasks"]
     results_bucket = os.environ["results_bucket"]
+    best_bucket = os.environ["best_bucket"]
     ddb = os.environ["ddb"]
-    queue = os.environ["reduce_queue"]
 
-    mentors_key = f"{match_id}-mentors.json"
-    mentees_key = f"{match_id}-mentees.json"
+    matches_list = []
 
     s3_connection = boto3.client("s3")
-    mentors = json.loads(
-        s3_connection.get_object(Bucket=bucket, Key=mentors_key)["Body"]
-        .read()
-        .decode("utf-8")
-    )
-    mentees = json.loads(
-        s3_connection.get_object(Bucket=bucket, Key=mentees_key)["Body"]
-        .read()
-        .decode("utf-8")
-    )
+    for i in range(total_tasks):
+        key = f"{match_id}/{i}.json"
+        print(f"Fetching {key}")
+        json_from_matches = json.loads(
+            s3_connection.get_object(Bucket=results_bucket, Key=key)["Body"]
+            .read()
+            .decode("utf-8")
+        )
+        mentors = [
+            CSMentor(**x["csmentor"]) for x in json_from_matches["matched_mentors"]
+        ]
+        mentees = [
+            CSMentee(**x["csmentee"]) for x in json_from_matches["matched_mentees"]
+        ]
+        unmatched_bonus = json_from_matches["unmatched_bonus"]
+        matches_list.append((mentors, mentees, unmatched_bonus))
 
-    cs_mentees = [CSMentee(**x) for x in mentees]
-    cs_mentors = [CSMentor(**x) for x in mentors]
+    print("Matches list length: " + str(len(matches_list)))
+    highest_count = {"mentors": 0, "mentees": 0}
+    best_outcome = matches_list[0]
+    for participant_tuple in matches_list:
+        mentors, mentees, unmatched_bonus = participant_tuple
+        one_connection_min_func = functools.partial(
+            map, lambda participant: len(participant.connections) > 0
+        )
+        current_count = {
+            "mentors": sum(one_connection_min_func(mentors)),
+            "mentees": sum(one_connection_min_func(mentees)),
+        }
+        print(
+            f"For unmatched bonus {unmatched_bonus} - Mentors: {current_count['mentors']}, Mentees: {current_count['mentees']}"
+        )
+        if (current_count["mentees"] > highest_count["mentees"]) or (  # type: ignore
+            current_count["mentees"] == highest_count["mentees"]
+            and current_count["mentors"] > highest_count["mentors"]  # type: ignore
+        ):  # type: ignore
+            print("New best outcome found")
+            best_outcome = participant_tuple
+            highest_count = current_count  # type: ignore
 
-    all_rules = [base_rules() for _ in range(3)]
-    for ruleset in all_rules:
-        ruleset.append(UnmatchedBonus(unmatched_bonus))
-    matched_mentors, matched_mentees = process.process_data(
-        cs_mentors, cs_mentees, all_rules=all_rules
-    )
-    match_key = f"{match_id}/{unmatched_bonus}.json"
-    match_object = io.BytesIO(
+    best_object = io.BytesIO(
         json.dumps(
             {
-                "matched_mentors": [x.to_dict() for x in matched_mentors],
-                "matched_mentees": [x.to_dict() for x in matched_mentees],
-                "unmatched_bonus": unmatched_bonus,
+                "matched_mentors": [x.to_dict_for_output() for x in best_outcome[0]],
+                "matched_mentees": [x.to_dict_for_output() for x in best_outcome[1]],
+                "unmatched_bonus": best_outcome[2],
             }
         ).encode("utf-8")
     )
+
     s3_results_response = s3_connection.upload_fileobj(
-        match_object, results_bucket, match_key
+        best_object, best_bucket, f"{match_id}.json"
     )
+
     ddb_connection = boto3.client("dynamodb")
-    response = ddb_connection.update_item(
+    dt = datetime.now()
+    ddb_connection.update_item(
         TableName=ddb,
         Key={"id": {"S": match_id}},
-        UpdateExpression="SET remaining_tasks = remaining_tasks - :i",
-        ExpressionAttributeValues={":i": {"N": "1"}},
-        ReturnValues="ALL_NEW",
+        UpdateExpression="SET end_time = :i, #status = :j",
+        ExpressionAttributeValues={
+            ":i": {"S": dt.isoformat()},
+            ":j": {"S": "COMPLETE"},
+        },
+        ExpressionAttributeNames={"#status": "status"},
+        ReturnValues="UPDATED_NEW",
     )
-    print(response)
-    remaining = response["Attributes"]["remaining_tasks"]["N"]
-    print(remaining)
-    tasks = int(response["Attributes"]["total_tasks"]["N"])
-    if remaining == "0":
-
-        sqs_connection = boto3.client("sqs")
-        queue_message = json.dumps({"match_id": match_id, "total_tasks": tasks})
-        response = sqs_connection.send_message(
-            QueueUrl=queue, MessageBody=queue_message
-        )
-
     return 1
